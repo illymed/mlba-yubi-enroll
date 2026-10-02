@@ -26,6 +26,7 @@ Each result contains:
 - Stage reached and a message
 - `yubienroll` exit code (when enrollment ran)
 - Key details from `ykman`: device type, serial number, firmware, form factor, USB interfaces, NFC state, and FIDO2 availability
+- Enrollment profile used
 - Temporary PIN
 - Completion time in UTC
 
@@ -41,6 +42,7 @@ The script maintains a persistent local enrollment log (`fido2-enrollment-log.cs
 - Device type, firmware version, form factor, enabled USB interfaces, and FIDO2 USB/NFC state
 - Temporary PIN
 - Tenant, enrolled-by name, and enrolled-by email
+- Enrollment profile used
 
 If the log cannot be updated after a successful enrollment, the script offers to retry, continue without logging, or abort. Updates are written atomically, so a failed write does not corrupt the existing log.
 
@@ -51,6 +53,17 @@ The run reports and the enrollment log contain plaintext temporary PINs and must
 - Do not attach them to tickets or send them through ordinary email; if sharing is needed, create a copy with the PIN columns removed.
 - Deliver PINs to users through the approved secure process, and do not copy them into ticket notes.
 - The reports are not proof of registration; confirm registered methods in Entra ID.
+
+### Enrollment profiles
+No YubiEnroll profile is needed. After inspecting each key with `ykman info`, the script picks a built-in profile by device type and passes its settings to `yubienroll credentials add` as flags. The profile used is recorded in the reports and log.
+
+| Profile | Matches | Always-UV | Min PIN | Force PIN change | Reset | Random PIN |
+|---|---|---|---|---|---|---|
+| YubiKey Security Key Line | `Security Key*` | On | 4 | Yes | Yes | Yes (4) |
+| YubiKey 5 Nano | `YubiKey 5 Nano` | Off | 4 | No | Yes | Yes (4) |
+
+Other models stop with a "no profile" error for that user. Add a profile to `$script:EnrollmentProfiles` at the top of the script to support them, or use `-YubiEnrollProfile` to apply one YubiEnroll profile to every key.
+
 ### CSV Input
 Preferred format, with a header row (`TicketId` and `OperatorNote` are optional and appear in the reports):
 
@@ -71,7 +84,7 @@ Before you can run the script to enroll keys for users, ensure that you meet the
 - `YubiEnroll` CLI app installed on local machine
 - `YubiKey Manager` CLI app installed on local machine
 - Windows PowerShell 5.1+ 
-- CSV file containing the list of users to enroll
+- CSV file containing the list of users to enroll (optional; a single user can be entered manually)
 ### Microsoft Prerequisites
 - Access to a Microsoft 365 account with permissions in the target tenant meeting or exceeding:
   - Privileged Authentication Administrator
@@ -119,31 +132,22 @@ Before you can run the script to enroll keys for users, ensure that you meet the
      - Commercial and GCC Microsoft 365 tenants: https://graph.microsoft.com
      - GCC High Microsoft 365 tenants: https://graph.microsoft.us
      - DoD Microsoft 365 tenants: https://dod-graph.microsoft.us
-4. When prompted to create a profile, select Yes. The profile is a set of options that will be used by default when enrolling each key.
-5. Configure the profile settings as shown below:
-   - Profile Name `default` or `<any-name>`
-   - Min Pin Length `4`
-   - Always require UV? `Y`
-   - Require Enterprise Attestation? `N`
-   - Force Pin Change Before Use? `Y`
-   - Factory Reset the Security Key? `Y`
-   - Set a new random PIN? `Y`
-   - Random PIN length `4`
-6. If prompted to activate the created provider, select Yes.
-7. Enter `yubienroll login` and follow the prompts to sign in with the enrolling admin account.
-8. If prompted via Windows to "allow network access" select Yes.
+4. If prompted to create a profile, select No. The script supplies enrollment settings per key model (see [Enrollment profiles](#enrollment-profiles)).
+5. If prompted to activate the created provider, select Yes.
+6. Enter `yubienroll login` and follow the prompts to sign in with the enrolling admin account.
+7. If prompted via Windows to "allow network access" select Yes.
 
 ## Running the Script
 Once YubiEnroll has been set up, you can begin enrolling users.
 1. Place the script inside its own folder.
 2. Open PowerShell and run the script. The following flags are supported:
    - `-i <file-path>` / `-InputCsv <file-path>` allows a CSV file to be input before run; defaults to interactive input prompt.
-   - `-OutputDirectory <chosen-path>` specifies the target path for the run reports; defaults to `<script-root>\<chosen-path>`
+   - `-OutputDirectory <chosen-path>` specifies the parent folder for run reports (each run gets its own `<run-id>` subfolder); defaults to `<script-root>\run-reports`
    - `-EnrollmentLogPath <file-path>` specifies the target path for the persistent enrollment log; defaults to the script root.  
    - `-YubiEnrollCommand <chosen-command>` specifies a custom command for YubiEnroll; defaults to `yubienroll` via `PATH`
    - `-YkmanCommand <chosen-command>` specifies a custom command for YubiKey Manager; defaults to `ykman` via `PATH`
-   - `-YubiEnrollProfile <profile-name>` selects a specific YubiEnroll profile to be used for that run; defaults to the current YubiEnroll configuration.
-3. The current YubiEnroll configuration will be displayed. If correct, select `Y`
+   - `-YubiEnrollProfile <profile-name>` overrides the built-in model profiles and uses this YubiEnroll profile for every key in the run.
+3. The active YubiEnroll provider and the built-in profile table will be displayed. If correct, select `Y`
 4. Enter the following information when prompted:
     
         note: this information is only run metadata and will not be used to validate the operator or tenant in script logic.
@@ -153,7 +157,7 @@ Once YubiEnroll has been set up, you can begin enrolling users.
 - `Enrolled-by Email`
 
 5.   Follow the prompts onscreen to enroll security keys for each account included in the CSV file.
-6. When the script finishes, a run report will be generated that contains a record of each enrollment operation. The report will be generated at `<script-root>\run-reports\<your-run's-id>\`.
+6. When the script finishes, a run report will be generated that contains a record of each enrollment operation. The report will be generated at `<OutputDirectory>\<your-run's-id>\` (default `<script-root>\run-reports\<your-run's-id>\`).
 
 
 # Supporting Documentation to Write

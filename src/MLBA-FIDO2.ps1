@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# See MLBA-FIDO2-Usage.md for prerequisites, input CSV format, and report handling.
+# See docs/README.md for prerequisites, input CSV format, and report handling; docs/MLBA-FIDO2-Spec.md for behavior.
 
 [CmdletBinding()]
 param(
@@ -20,6 +20,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Per-model enrollment settings passed to `yubienroll credentials add` as flags; first DeviceTypePattern match (against `ykman info`) wins.
+$script:EnrollmentProfiles = @(
+	[pscustomobject]@{ Name = 'YubiKey Security Key Line'; DeviceTypePattern = '^Security Key'; MinPinLength = 4; RequireAlwaysUv = $true; RequireEa = $false; ForcePinChange = $true; Reset = $true; RandomPin = $true; RandomPinLength = 4 }
+	[pscustomobject]@{ Name = 'YubiKey 5 Nano'; DeviceTypePattern = '^YubiKey 5 Nano'; MinPinLength = 4; RequireAlwaysUv = $false; RequireEa = $false; ForcePinChange = $false; Reset = $true; RandomPin = $true; RandomPinLength = 4 }
+)
 
 function New-RunId {
 	return (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmssZ')
@@ -88,7 +94,7 @@ function Invoke-YubiEnrollReadOnlyCommand {
 
 function Write-SafeConfigurationOutput {
 	param(
-		[Parameter(Mandatory)][string[]]$Lines
+		[Parameter(Mandatory)][AllowEmptyString()][AllowEmptyCollection()][string[]]$Lines
 	)
 
 	foreach ($line in $Lines) {
@@ -111,18 +117,17 @@ function Confirm-YubiEnrollContext {
 	$activeProviderName = [regex]::Match([string]$activeProviderMatch[0], "Active provider set to '([^']+)'").Groups[1].Value
 
 	$providerConfiguration = Invoke-YubiEnrollReadOnlyCommand -Arguments @('providers', 'show', $activeProviderName) -Description "Active provider configuration for '$activeProviderName'"
-	$profileConfiguration = Invoke-YubiEnrollReadOnlyCommand -Arguments @('profiles', 'list') -Description 'YubiEnroll profile listing'
 
 	Write-OperatorMessage 'YUBIENROLL PREFLIGHT: status' -Color Yellow
 	Write-SafeConfigurationOutput -Lines $status.Output
 	Write-OperatorMessage "YUBIENROLL PREFLIGHT: active provider configuration ($activeProviderName)" -Color Yellow
 	Write-SafeConfigurationOutput -Lines $providerConfiguration.Output
-	Write-OperatorMessage 'YUBIENROLL PREFLIGHT: available profile configuration' -Color Yellow
-	Write-SafeConfigurationOutput -Lines $profileConfiguration.Output
 	if (-not [string]::IsNullOrWhiteSpace($YubiEnrollProfile)) {
-		Write-OperatorMessage "Enrollment profile override requested by this script: $YubiEnrollProfile" -Color Cyan
+		Write-OperatorMessage "YUBIENROLL PREFLIGHT: using the YubiEnroll profile '$YubiEnrollProfile' for every key (-YubiEnrollProfile override); built-in model profiles are ignored." -Color Yellow
 	} else {
-		Write-OperatorMessage 'No -YubiEnrollProfile override supplied; YubiEnroll will use the profile assigned to the active provider, or its interactive defaults.' -Color Cyan
+		Write-OperatorMessage 'YUBIENROLL PREFLIGHT: built-in enrollment profiles, selected per key by device type from ykman info' -Color Yellow
+		$profileTable = $script:EnrollmentProfiles | Format-Table Name, DeviceTypePattern, MinPinLength, RequireAlwaysUv, RequireEa, ForcePinChange, Reset, RandomPin, RandomPinLength -AutoSize | Out-String -Width 200
+		Write-SafeConfigurationOutput -Lines @($profileTable.TrimEnd() -split '\r?\n')
 	}
 	Write-OperatorMessage 'ACTION: verify the active provider, tenant, authentication status, and effective profile before continuing.' -Color Yellow
 
@@ -166,6 +171,7 @@ function Write-RunReport {
 		@{ Name = 'NfcTransportEnabled'; Expression = { if ($null -eq $_.YubiKeyInfo) { '' } else { $_.YubiKeyInfo.NfcTransportEnabled } } }
 		@{ Name = 'Fido2Usb'; Expression = { if ($null -eq $_.YubiKeyInfo) { '' } else { $_.YubiKeyInfo.Fido2Usb } } }
 		@{ Name = 'Fido2Nfc'; Expression = { if ($null -eq $_.YubiKeyInfo) { '' } else { $_.YubiKeyInfo.Fido2Nfc } } }
+		@{ Name = 'EnrollmentProfile'; Expression = { if ($null -eq $_.YubiKeyInfo -or $null -eq $_.YubiKeyInfo.PSObject.Properties['EnrollmentProfile']) { '' } else { $_.YubiKeyInfo.EnrollmentProfile } } }
 		@{ Name = 'TemporaryPin'; Expression = { $_.TemporaryPin } }
 	)
 	$reportItems | Select-Object -Property $csvProperties |
@@ -315,6 +321,7 @@ function Add-SuccessfulEnrollment {
 		Tenant             = $Metadata.Tenant
 		EnrolledByName     = $Metadata.EnrolledByName
 		EnrolledByEmail    = $Metadata.EnrolledByEmail
+		EnrollmentProfile  = if ($null -ne $YubiKeyInfo.PSObject.Properties['EnrollmentProfile']) { $YubiKeyInfo.EnrollmentProfile } else { '' }
 	}
 
 	$logColumns = @(
@@ -332,6 +339,7 @@ function Add-SuccessfulEnrollment {
 		'Tenant'
 		'EnrolledByName'
 		'EnrolledByEmail'
+		'EnrollmentProfile'
 	)
 	$allRecords = @()
 	if (Test-Path -LiteralPath $EnrollmentLogPath -PathType Leaf) {
@@ -350,35 +358,100 @@ function Add-SuccessfulEnrollment {
 	Write-OperatorMessage "Enrollment logged as $($record.AssetName)." -Color Green
 }
 
+function Select-EnrollmentProfile {
+	param(
+		[Parameter(Mandatory)]$YubiKeyInfo
+	)
+
+	foreach ($enrollmentProfile in $script:EnrollmentProfiles) {
+		if ($YubiKeyInfo.DeviceType -match $enrollmentProfile.DeviceTypePattern) {
+			return $enrollmentProfile
+		}
+	}
+	throw "No built-in enrollment profile matches device type '$($YubiKeyInfo.DeviceType)'. Add one to `$script:EnrollmentProfiles or use -YubiEnrollProfile."
+}
+
+function Get-EnrollmentProfileArguments {
+	param(
+		[Parameter(Mandatory)]$EnrollmentProfile
+	)
+
+	$flags = @('--min-pin-length', [string]$EnrollmentProfile.MinPinLength)
+	$flags += if ($EnrollmentProfile.RequireAlwaysUv) { '--require-always-uv' } else { '--no-require-always-uv' }
+	$flags += if ($EnrollmentProfile.RequireEa) { '--require-ea' } else { '--no-require-ea' }
+	$flags += if ($EnrollmentProfile.ForcePinChange) { '--force-pin-change' } else { '--no-force-pin-change' }
+	$flags += if ($EnrollmentProfile.Reset) { '--reset' } else { '--no-reset' }
+	if ($EnrollmentProfile.RandomPin) {
+		$flags += @('--random-pin', '--random-pin-length', [string]$EnrollmentProfile.RandomPinLength)
+	} else {
+		$flags += '--no-random-pin'
+	}
+	return $flags
+}
+
 function Invoke-YubiEnroll {
 	param(
-		[Parameter(Mandatory)][string]$UserPrincipalName
+		[Parameter(Mandatory)][string]$UserPrincipalName,
+		$EnrollmentProfile = $null
 	)
 
 	$arguments = @('credentials', 'add', $UserPrincipalName)
 	if (-not [string]::IsNullOrWhiteSpace($YubiEnrollProfile)) {
-		$arguments += @('--profile', $YubiEnrollProfile)
+		$arguments += @('--profile', $YubiEnrollProfile, '--force')
+	} elseif ($null -ne $EnrollmentProfile) {
+		$arguments += Get-EnrollmentProfileArguments -EnrollmentProfile $EnrollmentProfile
+		$arguments += '--force'
 	}
 
-	# Capture stdout line-by-line for the generated PIN while echoing it so the
-	# operator still sees YubiEnroll's interactive output. Stderr remains attached.
 	$script:LastYubiEnrollTemporaryPin = $null
 	$script:LastYubiEnrollExitCode = $null
-	& $YubiEnrollCommand @arguments | ForEach-Object {
-		$line = [string]$_
-		Write-Host $line
-		$pinMatch = [regex]::Match($line, '^Temporary PIN:\s*(.+)$')
-		if ($pinMatch.Success) {
-			$script:LastYubiEnrollTemporaryPin = $pinMatch.Groups[1].Value.Trim()
-		}
+
+	$resolvedCommand = Get-Command -Name $YubiEnrollCommand -CommandType Application -ErrorAction Stop | Select-Object -First 1
+	$quotedArguments = foreach ($argument in $arguments) {
+		if ($argument -match '[\s"]') { '"' + ($argument -replace '"', '\"') + '"' } else { $argument }
 	}
-	$exitCode = $LASTEXITCODE
+	$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+	$startInfo.FileName = $resolvedCommand.Source
+	$startInfo.Arguments = $quotedArguments -join ' '
+	$startInfo.UseShellExecute = $false
+	$startInfo.RedirectStandardOutput = $true
+	$startInfo.RedirectStandardError = $true
+
+	# Pipeline output is line-buffered, which hides prompts without a trailing newline; echo raw chunks instead.
+	# Stdin stays attached to the console; stderr is read concurrently so the PIN is found wherever YubiEnroll prints it.
+	$capturedOutput = New-Object System.Text.StringBuilder
+	$process = [System.Diagnostics.Process]::Start($startInfo)
+	try {
+		$errorTask = $process.StandardError.ReadToEndAsync()
+		$readBuffer = New-Object 'char[]' 1024
+		while (($count = $process.StandardOutput.Read($readBuffer, 0, $readBuffer.Length)) -gt 0) {
+			$chunk = [string]::new($readBuffer, 0, $count)
+			[Console]::Out.Write($chunk)
+			[Console]::Out.Flush()
+			[void]$capturedOutput.Append($chunk)
+		}
+		$process.WaitForExit()
+		$errorText = $errorTask.Result
+		if ($errorText) {
+			[Console]::Error.Write($errorText)
+			[void]$capturedOutput.AppendLine().Append($errorText)
+		}
+		$exitCode = $process.ExitCode
+	} finally {
+		$process.Dispose()
+	}
+
+	$plainOutput = [regex]::Replace($capturedOutput.ToString(), '\x1b\[[0-9;?]*[A-Za-z]', '')
+	$pinMatches = [regex]::Matches($plainOutput, '(?im)^[ \t]*(?:(?:temporary|random|new|generated)[ \t]+)*PIN(?:[ \t]+is)?[ \t]*[:=][ \t]*(\S.*?)[ \t]*\r?$')
+	if ($pinMatches.Count -gt 0) {
+		$script:LastYubiEnrollTemporaryPin = $pinMatches[$pinMatches.Count - 1].Groups[1].Value.Trim()
+	}
 	$script:LastYubiEnrollExitCode = $exitCode
 	if ($exitCode -ne 0) {
 		throw "yubienroll returned exit code $exitCode. Review the native command output displayed above."
 	}
 	if ([string]::IsNullOrWhiteSpace($script:LastYubiEnrollTemporaryPin)) {
-		Write-Warning 'Enrollment succeeded, but YubiEnroll output did not contain a recognizable Temporary PIN line; the PIN could not be saved to the inventory or run report.'
+		Write-Warning 'Enrollment succeeded, but no PIN line (e.g. "Temporary PIN: ...") was found in YubiEnroll output; the PIN could not be saved to the inventory or run report. Copy it from the output above.'
 	}
 }
 
@@ -406,14 +479,15 @@ function Invoke-YkmanInfo {
 		elseif ($line -match '^Form factor:\s*(.+)$') { $formFactor = $Matches[1].Trim() }
 		elseif ($line -match '^Enabled USB interfaces:\s*(.+)$') { $enabledUsbInterfaces = $Matches[1].Trim() }
 		elseif ($line -match '^NFC transport is enabled\s*$') { $nfcTransportEnabled = $true }
-		elseif ($line -match '^FIDO2\s+(Enabled|Not available)\s+(Enabled|Not available)\s*$') {
+		elseif ($line -match '^FIDO2\s+(Enabled|Disabled|Not available)(?:\s+(Enabled|Disabled|Not available))?\s*$') {
 			$fido2Usb = $Matches[1]
-			$fido2Nfc = $Matches[2]
+			# Keys without NFC (e.g. YubiKey 5 Nano) list only a USB column.
+			$fido2Nfc = if ($Matches[2]) { $Matches[2] } else { 'Not available' }
 			$fido2InfoFound = $true
 		}
 	}
 	if (-not $deviceTypeFound -or -not $firmwareVersionFound -or -not $fido2InfoFound) {
-		throw 'ykman info output did not include the expected device type, firmware version, and FIDO2 details.'
+		throw ("ykman info output did not include the expected device type, firmware version, and FIDO2 details. Output received:" + [Environment]::NewLine + ($output -join [Environment]::NewLine))
 	}
 
 	return [pscustomobject]@{
@@ -555,9 +629,19 @@ try {
 				$stage = 'YubiKeyInspection'
 				$ykmanInfo = Invoke-WithRetryChoice -Operation "YubiKey inspection for $($inputRow.UserPrincipalName)" -Action { Invoke-YkmanInfo }
 
+				$stage = 'ProfileSelection'
+				$enrollmentProfile = $null
+				$profileName = "YubiEnroll profile: $YubiEnrollProfile"
+				if ([string]::IsNullOrWhiteSpace($YubiEnrollProfile)) {
+					$enrollmentProfile = Select-EnrollmentProfile -YubiKeyInfo $ykmanInfo
+					$profileName = $enrollmentProfile.Name
+					Write-OperatorMessage "Detected $($ykmanInfo.DeviceType); using enrollment profile '$profileName'." -Color Cyan
+				}
+				$ykmanInfo | Add-Member -NotePropertyName EnrollmentProfile -NotePropertyValue $profileName -Force
+
 				$stage = 'YubiEnroll'
 				$script:LastYubiEnrollTemporaryPin = $null
-				Invoke-YubiEnroll -UserPrincipalName $inputRow.UserPrincipalName
+				Invoke-YubiEnroll -UserPrincipalName $inputRow.UserPrincipalName -EnrollmentProfile $enrollmentProfile
 				$ykmanInfo | Add-Member -NotePropertyName SerialNumber -NotePropertyValue (Get-YubiKeySerialNumber) -Force
 				$enrollmentSucceeded = $true
 				$exitCode = 0

@@ -1,6 +1,6 @@
 # Pester 3.4-compatible tests. These tests mock all external enrollment/device commands.
 
-$scriptUnderTest = Join-Path $PSScriptRoot 'MLBA-FIDO2.ps1'
+$scriptUnderTest = Join-Path $PSScriptRoot '..\src\MLBA-FIDO2.ps1'
 . $scriptUnderTest
 
 $global:Fido2TestReadHostResponses = @()
@@ -230,10 +230,9 @@ Describe 'MLBA FIDO2 script behavior' {
 		$global:Fido2TestReadHostResponses = @('N')
 		$confirmed = Confirm-YubiEnrollContext
 		$confirmed | Should Be $false
-		$global:Fido2TestYubiEnrollCalls.Count | Should Be 3
+		$global:Fido2TestYubiEnrollCalls.Count | Should Be 2
 		($global:Fido2TestYubiEnrollCalls[0] -join ' ') | Should Be 'status'
 		($global:Fido2TestYubiEnrollCalls[1] -join ' ') | Should Be 'providers show Test Provider'
-		($global:Fido2TestYubiEnrollCalls[2] -join ' ') | Should Be 'profiles list'
 	}
 
 	It 'stops before metadata and report setup when provider preflight is declined' {
@@ -245,7 +244,45 @@ Describe 'MLBA FIDO2 script behavior' {
 		$global:Fido2TestReadHostResponses = @('N')
 		Invoke-Main
 		Test-Path -LiteralPath $script:OutputDirectory | Should Be $false
-		$global:Fido2TestYubiEnrollCalls.Count | Should Be 3
+		$global:Fido2TestYubiEnrollCalls.Count | Should Be 2
+	}
+
+	It 'accepts a single-column FIDO2 line from keys without NFC' {
+		function global:Write-TestNanoYkmanInfo {
+			$global:LASTEXITCODE = 0
+			@('Device type: YubiKey 5 Nano', 'Firmware version: 5.4.3', 'Form factor: Nano (USB-A)', 'Enabled USB interfaces: OTP, FIDO, CCID', '', 'Applications    USB', 'FIDO2           Enabled')
+		}
+		$script:YkmanCommand = 'Write-TestNanoYkmanInfo'
+		$info = Invoke-YkmanInfo
+		$info.Fido2Usb | Should Be 'Enabled'
+		$info.Fido2Nfc | Should Be 'Not available'
+		$script:YkmanCommand = 'Write-TestYkmanInfo'
+	}
+
+	It 'selects the built-in enrollment profile by device type' {
+		(Select-EnrollmentProfile -YubiKeyInfo ([pscustomobject]@{ DeviceType = 'Security Key NFC' })).Name | Should Be 'YubiKey Security Key Line'
+		(Select-EnrollmentProfile -YubiKeyInfo ([pscustomobject]@{ DeviceType = 'YubiKey 5 Nano' })).Name | Should Be 'YubiKey 5 Nano'
+		$threw = $false
+		try { Select-EnrollmentProfile -YubiKeyInfo ([pscustomobject]@{ DeviceType = 'Unknown Key' }) | Out-Null } catch { $threw = $true }
+		$threw | Should Be $true
+	}
+
+	It 'builds yubienroll flags from an enrollment profile' {
+		$flags = (Get-EnrollmentProfileArguments -EnrollmentProfile $script:EnrollmentProfiles[0]) -join ' '
+		$flags | Should Be '--min-pin-length 4 --no-require-always-uv --no-require-ea --force-pin-change --reset --random-pin --random-pin-length 4'
+	}
+
+	It 'captures a PIN printed on stderr or with a different label' {
+		$commandPath = Join-Path $TestDrive 'mock-yubienroll-stderr.cmd'
+		@(
+			'@echo off'
+			'echo Random PIN: ERR-9999>&2'
+			'exit /b 0'
+		) | Set-Content -LiteralPath $commandPath -Encoding ASCII
+		$script:YubiEnrollCommand = $commandPath
+		$script:YubiEnrollProfile = $null
+		Invoke-YubiEnroll -UserPrincipalName 'capture@example.com'
+		$script:LastYubiEnrollTemporaryPin | Should Be 'ERR-9999'
 	}
 
 	It 'writes temporary PINs and operator notes to run reports' {

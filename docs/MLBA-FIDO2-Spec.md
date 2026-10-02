@@ -8,7 +8,7 @@ Bulk pre-provision FIDO2 YubiKeys for Microsoft 365 users by driving the locally
 
 In scope:
 - Collect users (single or CSV), run metadata, and operator confirmations.
-- Preflight display of the YubiEnroll provider/profile for operator review.
+- Preflight display of the YubiEnroll provider and the script's built-in enrollment profile table for operator review.
 - Inspect each key with `ykman`, enroll with `yubienroll`, record serial and temporary PIN.
 - Produce per-run JSON/CSV reports and a persistent inventory log.
 
@@ -25,7 +25,7 @@ Out of scope (the script must not):
 - ENV-1 Windows PowerShell 5.1+ (`#requires -Version 5.1`); PowerShell 7 also supported.
 - ENV-2 `yubienroll` on `PATH` or supplied via `-YubiEnrollCommand`.
 - ENV-3 `ykman` on `PATH` or supplied via `-YkmanCommand`.
-- ENV-4 YubiEnroll provider already configured and logged in by the operator.
+- ENV-4 YubiEnroll provider already configured and logged in by the operator. No YubiEnroll profile is required; the script supplies settings per key (section 7.4).
 - ENV-5 Tenant FIDO2 policy already allows the key's AAGUID.
 - ENV-6 One tenant per run (tenant is free-text metadata only; not validated).
 - ENV-7 Strict mode on (`Set-StrictMode -Version Latest`), `$ErrorActionPreference = 'Stop'`.
@@ -40,7 +40,7 @@ Out of scope (the script must not):
 | `-EnrollmentLogPath` | | string | `<script-root>\fido2-enrollment-log.csv` | Persistent inventory log. |
 | `-YubiEnrollCommand` | | string | `yubienroll` | Name or full path. |
 | `-YkmanCommand` | | string | `ykman` | Name or full path. |
-| `-YubiEnrollProfile` | | string | none | If set, passes `--profile <name>` to `yubienroll credentials add`. |
+| `-YubiEnrollProfile` | | string | none | Override: use this YubiEnroll-side profile (`--profile <name> --force`) for every key instead of the built-in model profiles. |
 
 ## 4. Run Flow **[Current]**
 
@@ -58,7 +58,7 @@ Start
 ```
 
 - FLOW-2 Missing command throws; operator chooses `R` retry or `A` abort.
-- FLOW-3 Runs read-only: `yubienroll status`, `yubienroll providers show <active-provider>`, `yubienroll profiles list`. Active provider is parsed from the status line `Active provider set to '<name>'`. If it cannot be parsed, the run stops with output shown. Output lines matching secret-like keys (`client_secret`, `secret`, `access_token`, `refresh_token`, `password`, `private_key`) are redacted. The `-YubiEnrollProfile` override (or its absence) is displayed. Prompt: `Does this provider and profile configuration look OK? (Y/N)`. `N` stops before metadata, report directory creation, key inspection, or enrollment.
+- FLOW-3 Runs read-only: `yubienroll status` and `yubienroll providers show <active-provider>`, then prints the built-in profile table (or the `-YubiEnrollProfile` override notice). Active provider is parsed from the status line `Active provider set to '<name>'`. If it cannot be parsed, the run stops with output shown. Output lines matching secret-like keys (`client_secret`, `secret`, `access_token`, `refresh_token`, `password`, `private_key`) are redacted. Prompt: `Does this provider and profile configuration look OK? (Y/N)`. `N` stops before metadata, report directory creation, key inspection, or enrollment.
 - FLOW-4 All three metadata values are required and trimmed. This data is not used to validate the operator or tenant.
 - FLOW-7 Accepts only `Y` or `N` (case-insensitive).
 - FLOW-9 Reports are written even when the run is aborted or fails after the run directory was created.
@@ -71,10 +71,11 @@ For each input row, in order:
 1. USER-1 Prompt: insert the intended key, press Enter to continue or `S`/`SKIP` to skip. Any other text re-prompts.
 2. USER-2 Skip => record `Skipped` / stage `OperatorConfirmation` / message `Operator skipped this user`; next user.
 3. USER-3 Stage `YubiKeyInspection`: run `ykman info` (output captured, not shown). Failure => retry/abort prompt (`R`/`A`) around inspection.
-4. USER-4 Stage `YubiEnroll`: run `yubienroll credentials add <UPN> [--profile <name>]` directly in the terminal. Stdout is streamed to the console line by line and scanned for `Temporary PIN: <value>`. Non-zero exit code => failure. Missing PIN line on success => warning only.
-5. USER-5 Immediately after success (key still connected) run `ykman list --serials` and attach the serial to the key info.
-6. USER-6 Append to the persistent enrollment log (section 7). On failure, operator may `R` retry logging, `S` continue without logging, or `A` abort.
-7. USER-7 Record `Succeeded` / stage `Registration` / message `yubienroll completed`.
+4. USER-3a Stage `ProfileSelection` (skipped when `-YubiEnrollProfile` is set): choose the built-in profile for the detected device type (section 7.4). No match => failure handled per USER-8.
+5. USER-4 Stage `YubiEnroll`: run `yubienroll credentials add <UPN>` with the profile's settings as flags plus `--force` (or `--profile <name> --force` for the override). Stdout is streamed live to the console; stderr is read concurrently and echoed afterwards. Both are scanned for a PIN line (`[Temporary|Random|New|Generated] PIN: <value>`, ANSI codes stripped). Non-zero exit code => failure. Missing PIN line on success => warning only.
+6. USER-5 Immediately after success (key still connected) run `ykman list --serials` and attach the serial to the key info.
+7. USER-6 Append to the persistent enrollment log (section 7). On failure, operator may `R` retry logging, `S` continue without logging, or `A` abort.
+8. USER-7 Record `Succeeded` / stage `Registration` / message `yubienroll completed`.
 
 Failure handling per user:
 - USER-8 Any failure before enrollment success: warn, then prompt `R` retry this user, `S` skip, or `A` abort.
@@ -101,18 +102,25 @@ Location: `<OutputDirectory>\<run-id>\run-report.json` and `run-report.csv`.
 
 - OUT-1 JSON: `RunId`, `Operator` (`DOMAIN\user`), `StartedUtc`, `CompletedUtc`, `InputCsv` (resolved path or null), `Results[]`.
 - OUT-2 Result fields: `UserPrincipalName`, `TicketId`, `OperatorNote`, `Status` (`Succeeded`/`Failed`/`Skipped`), `Stage`, `Message`, `ExitCode`, `YubiKeyInfo`, `TemporaryPin`, `CompletedUtc`.
-- OUT-3 CSV is flattened: the fields above plus `DeviceType`, `SerialNumber`, `FirmwareVersion`, `FormFactor`, `EnabledUsbInterfaces`, `NfcTransportEnabled`, `Fido2Usb`, `Fido2Nfc`, `TemporaryPin`. Encoding UTF-8.
+- OUT-3 CSV is flattened: the fields above plus `DeviceType`, `SerialNumber`, `FirmwareVersion`, `FormFactor`, `EnabledUsbInterfaces`, `NfcTransportEnabled`, `Fido2Usb`, `Fido2Nfc`, `EnrollmentProfile`, `TemporaryPin`. Encoding UTF-8.
 - OUT-4 Full YubiEnroll output is not captured, only the temporary PIN line.
 
 ### 7.2 Persistent enrollment log
 
 Location: `-EnrollmentLogPath`, CSV, appended across runs.
 
-- LOG-1 Columns, in order: `TimestampUtc`, `AssetName`, `UserPrincipalName`, `SerialNumber`, `DeviceType`, `FirmwareVersion`, `FormFactor`, `EnabledUsbInterfaces`, `Fido2Usb`, `Fido2Nfc`, `TemporaryPin`, `Tenant`, `EnrolledByName`, `EnrolledByEmail`.
+- LOG-1 Columns, in order: `TimestampUtc`, `AssetName`, `UserPrincipalName`, `SerialNumber`, `DeviceType`, `FirmwareVersion`, `FormFactor`, `EnabledUsbInterfaces`, `Fido2Usb`, `Fido2Nfc`, `TemporaryPin`, `Tenant`, `EnrolledByName`, `EnrolledByEmail`, `EnrollmentProfile`.
 - LOG-2 Only successful enrollments are logged.
 - LOG-3 `AssetName` is `YK-NNNN` (zero-padded to 4): max existing number + 1; `YK-0001` if the log is absent or has none.
 - LOG-4 Write is atomic: whole log rewritten to a temp file in the same folder, then moved over the original; temp file removed on failure. Older rows missing newer columns are rewritten with blanks.
 - LOG-5 The log directory is created if missing.
+
+### 7.4 Enrollment profiles
+
+- PROF-1 Profiles live in `$script:EnrollmentProfiles` at the top of the script: `Name`, `DeviceTypePattern` (regex against `Device type`), `MinPinLength`, `RequireAlwaysUv`, `RequireEa`, `ForcePinChange`, `Reset`, `RandomPin`, `RandomPinLength`. First match wins.
+- PROF-2 Shipped profiles: `YubiKey Security Key Line` (`^Security Key`; always-UV on, force PIN change on) and `YubiKey 5 Nano` (`^YubiKey 5 Nano`; always-UV off, force PIN change off). Both: min PIN 4, no EA, reset on, random PIN length 4. Other models fail with a no-match error until a profile is added.
+- PROF-3 Settings are passed as explicit flags (`--no-...` for false values), so no YubiEnroll-side profile needs to exist.
+- PROF-4 The profile name used is recorded in `EnrollmentProfile` in both reports and the log.
 
 ### 7.3 Key information (`ykman info` parsing)
 
