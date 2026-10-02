@@ -1,0 +1,5 @@
+# enrollment artifacts
+run-reports/
+fido2-enrollment-log.csv
+
+tests/
