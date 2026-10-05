@@ -1,3 +1,8 @@
-# enrollment artifacts
-run-reports/*
-fido2-enrollment-log.csv
+# Development-only specifications and tests; release only the script and README.
+/IGNORE/
+
+# Enrollment artifacts (the script defaults these under src/).
+/run-reports/
+/fido2-enrollment-log.csv
+/src/run-reports/
+/src/fido2-enrollment-log.csv
